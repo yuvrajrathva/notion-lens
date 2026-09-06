@@ -9,7 +9,9 @@ Notion Lens is a Chrome extension that provides a side panel UI for RAG-style qu
 - **Extension** (repo root): `manifest.json`, `background.js`, `sidepanel.html/css/js`. Pure vanilla JS/HTML/CSS, no build step, no bundler, no package.json.
 - **Backend** (`backend/`): a FastAPI service that implements the Notion OAuth 2.0 Authorization Code flow end-to-end (login, callback, token exchange, storage, status) and serves a stub RAG query endpoint.
 
-The side panel UI (`sidepanel.js`) has a placeholder `submitQuery()` that only logs to console — the query flow is not yet wired to the backend. Notion OAuth, however, is fully wired: the "Connect Notion" button drives a real backend-brokered OAuth flow and persists the resulting access token server-side. Sync is fully wired: on click of refresh button of sync it uses notion API to fetch the dayta and sync those part which came after last sync. Chunking the content, embedding those chunked data and storing in relevant Postgres table is done.
+Notion OAuth is fully wired: the "Connect Notion" button drives a real backend-brokered OAuth flow and persists the resulting access token server-side. Sync is fully wired, both manually (refresh button) and automatically: it uses the Notion API to fetch data and sync only content changed since the last sync (never a forced full re-index), chunking, embedding, and storing it in Postgres. Auto-sync fires at most once per day per connection, triggered either when the user opens the side panel or by a periodic APScheduler sweep (`backend/scheduler.py`), whichever comes first.
+
+The side panel's query flow (`sidepanel.js`) is fully wired to a real RAG pipeline: the user's question is embedded, the top-5 most similar chunks from their own workspace are retrieved via pgvector cosine similarity, and an LLM generates a grounded, cited answer. Multi-turn conversation is supported by resending trimmed history each turn (no server-side chat persistence).
 
 
 ## Commands
@@ -23,23 +25,32 @@ Root:
 - `background.js` — service worker; only sets the side panel to open on toolbar-icon click.
 - `sidepanel.html` — side panel markup: topbar, Notion connect bar, empty-state hero, and the query input bar.
 - `sidepanel.css` — all side panel styling, including the connect-bar states (disconnected/connecting/connected/error).
-- `sidepanel.js` — side panel behavior: Notion connect/status-poll flow, refresh button demo, and the (still-stubbed) query submit handler.
-- `.env` — real secrets (gitignored): `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `SESSION_SECRET`, `EMBEDDER_MODEL_API_KEY` (present but not yet consumed by any code — reserved for future embedding/RAG work).
+- `sidepanel.js` — side panel behavior: Notion connect/status-poll flow, manual + auto sync status polling with a relative "last synced" label, and the chat query flow (multi-turn thread UI, citations).
+- `.env` — real secrets (gitignored): `NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `NOTION_REDIRECT_URI`, `SESSION_SECRET`, `EMBEDDER_MODEL_API_KEY`, `GENERATION_MODEL_API_KEY`.
 
 `backend/`:
-- `main.py` — FastAPI app; defines the `/auth/notion/*` OAuth routes, `/notion/sync` sync new content if any and `/notion/sync/status` sync status.
-- `config.py` — loads and validates required env vars (`NOTION_CLIENT_ID`, `NOTION_CLIENT_SECRET`, `SESSION_SECRET`, `NOTION_REDIRECT_URI`) from the repo-root `.env`.
+- `main.py` — FastAPI app; defines the `/auth/notion/*` OAuth routes (status check also triggers due auto-sync), `/notion/sync` + `/notion/sync/status`, and `/notion/query` (RAG chat). Starts/stops the APScheduler via a `lifespan` hook.
+- `config.py` — loads and validates required env vars from the repo-root `.env`, plus model names/URLs and auto-sync tuning constants.
 - `notion_oauth.py` — builds the Notion authorize URL, signs/verifies the CSRF-safe `state` param (HMAC, 10-min TTL), and exchanges an authorization code for a token.
 - `db.py,` `models.py` — SQLAlchemy engine/session + the 4 ORM models (AppUser, NotionConnection, NotionPage, NotionChunk)
 - `alembic/` — migration environment wired to Settings.DATABASE_URL
-- `repositories.py` — upsert/query helpers
+- `repositories.py` — upsert/query helpers, plus `search_similar_chunks` (raw-SQL pgvector cosine search scoped to one user's connection, using `strict_order` iterative HNSW scan so the user-scoped WHERE filter can't silently starve the index of results) and `list_all_connections` (for the scheduler sweep)
 - `notion_client.py` — Search API pagination (with early-stop once last_edited_time <= since), recursive block-to-text extraction, /v1/users/me email lookup
 - `chunking.py` — fixed-size character windowing (1000/100 overlap)
-- `embeddings.py` — NVIDIA NIM client; verified live against the real API (2048-dim vectors confirmed)
-- `sync_service.py` — orchestrates the pipeline; commits each page as it's processed, only advances last_synced_at after the full run succeeds
-- `sync_status.py` — in-memory progress tracker for the frontend to poll
+- `embeddings.py` — NVIDIA NIM embeddings client (`nvidia/nemotron-3-embed-1b`, 2048-dim); `passage` mode for sync, `query` mode for chat questions
+- `generation.py` — NVIDIA chat-completions client for answer generation; strips any leaked `<think>` reasoning trace, retries transient 502/503/504s (observed live on NVIDIA's hosted "super" tier model)
+- `chat_service.py` — RAG orchestration: embeds the question, retrieves top-K chunks, builds a grounded prompt with numbered sources, calls generation, returns `{answer, citations}`; short-circuits with a fixed "nothing indexed" answer when retrieval finds nothing (no LLM call)
+- `sync_service.py` — orchestrates the pipeline; commits each page as it's processed; always advances `last_synced_at` after a successful run (even a no-op one, so auto-sync's once-a-day throttle works), only skips advancing it on failure
+- `sync_status.py` — in-memory progress tracker for the frontend to poll; also `should_auto_sync()`, the once-per-day-per-connection throttle (with a cooldown after failures) shared by both auto-sync trigger paths
+- `scheduler.py` — APScheduler `AsyncIOScheduler`; periodic sweep that auto-syncs any connection due per `should_auto_sync`, independent of whether the user opens the side panel
 - `requirements.txt` — pinned backend dependencies
 - `venv/` — local virtualenv (gitignored), not checked in.
+
+Auto-sync has two trigger paths sharing `sync_status.should_auto_sync()`: (1) `GET /auth/notion/status`, hit every time the side panel opens; (2) the APScheduler sweep, as a safety net for users who leave the panel closed. Neither ever forces a full re-index — both call the same incremental `sync_service.run_sync`.
+
+Chat is stateless server-side: the frontend resends trimmed conversation history (last few turns) with each question; there is no conversations/messages table. Citations are page-level, not block-level, since chunking loses block boundaries.
+
+`nvidia/llama-3.3-nemotron-super-49b-v1.5` (originally specified for generation) reached end-of-life on NVIDIA's API; `config.py` uses `nvidia/nemotron-3-super-120b-a12b` instead, its direct successor in the current model catalog.
 
 
 ## Rules

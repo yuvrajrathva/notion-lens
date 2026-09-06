@@ -1,20 +1,32 @@
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Query, Request
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+import chat_service
 import notion_client
 import notion_oauth
 import repositories
+import scheduler
 import sync_service
 import sync_status
 from db import get_session
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start_scheduler()
+    yield
+    scheduler.shutdown_scheduler()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # The side panel runs as an extension page (chrome-extension://<id>), and the
 # extension ID varies per install/dev-load, so we can't allowlist one origin.
@@ -176,7 +188,11 @@ def notion_complete(status: str = "success", reason: str = ""):
 
 
 @app.get("/auth/notion/status")
-def notion_status(app_user_id: str = Query(..., min_length=1, max_length=128), session: Session = Depends(get_session)):
+def notion_status(
+    background_tasks: BackgroundTasks,
+    app_user_id: str = Query(..., min_length=1, max_length=128),
+    session: Session = Depends(get_session),
+):
     error = _pending_errors.pop(app_user_id, None)
     if error:
         return {"connected": False, "error": error}
@@ -185,11 +201,18 @@ def notion_status(app_user_id: str = Query(..., min_length=1, max_length=128), s
     if not user_uuid:
         return {"connected": False}
 
-    connection = repositories.get_public_status(session, user_uuid)
-    if connection:
-        return {"connected": True, **connection}
+    connection = repositories.get_connection_for_user(session, user_uuid)
+    if not connection:
+        return {"connected": False}
 
-    return {"connected": False}
+    # The side panel calls this endpoint on every open, so it's the natural
+    # trigger for "sync automatically once per day when the user opens the app."
+    # The APScheduler sweep in scheduler.py covers users who leave it closed.
+    now = datetime.now(timezone.utc)
+    if sync_status.should_auto_sync(app_user_id, connection.last_synced_at, now):
+        background_tasks.add_task(sync_service.run_sync, user_uuid)
+
+    return {"connected": True, **repositories.get_public_status(session, user_uuid)}
 
 
 @app.post("/notion/sync", status_code=202)
@@ -216,3 +239,33 @@ async def start_notion_sync(
 @app.get("/notion/sync/status")
 def notion_sync_status(app_user_id: str = Query(..., min_length=1, max_length=128)):
     return sync_status.get_status(app_user_id)
+
+
+MAX_QUESTION_LENGTH = 2000
+
+
+@app.post("/notion/query")
+async def notion_query(
+    app_user_id: str = Query(..., min_length=1, max_length=128),
+    body: dict = Body(...),
+):
+    user_uuid = _parse_app_user_id(app_user_id)
+    if not user_uuid:
+        return JSONResponse({"error": "invalid_app_user_id"}, status_code=400)
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        return JSONResponse({"error": "missing_question"}, status_code=400)
+    if len(question) > MAX_QUESTION_LENGTH:
+        return JSONResponse({"error": "question_too_long"}, status_code=400)
+
+    history = body.get("history") or []
+
+    try:
+        result = await chat_service.answer_question(user_uuid, question, history)
+    except chat_service.NotConnectedError:
+        return JSONResponse({"error": "not_connected"}, status_code=409)
+    except chat_service.ChatError as exc:
+        return JSONResponse({"error": "generation_failed", "message": str(exc)}, status_code=502)
+
+    return result

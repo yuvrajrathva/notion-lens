@@ -8,6 +8,8 @@ const APP_USER_ID_KEY = 'notionLensAppUserId';
 const queryInput = document.getElementById('queryInput');
 const refreshBtn = document.getElementById('refreshBtn');
 const syncValue = document.getElementById('syncValue');
+const thread = document.getElementById('thread');
+const mainEmptyState = document.getElementById('mainEmptyState');
 
 
 // ---------- Notion connect ----------
@@ -52,7 +54,7 @@ function setConnectionState(state, detail) {
     connectBtn.textContent = 'Notion Connected';
     queryInput.disabled = false;
     queryInput.placeholder = 'Ask your notes…';
-    syncValue.textContent = formatSyncedAt(detail && detail.last_synced_at);
+    renderSyncValue(detail && detail.last_synced_at);
   } else if (state === 'connecting') {
     statusText.textContent = 'Connecting to Notion…';
     connectBtn.textContent = 'Connecting…';
@@ -80,6 +82,9 @@ async function checkNotionStatus() {
 
     if (data.connected) {
       setConnectionState('connected', data);
+      // Opening the panel may have triggered a daily auto-sync server-side;
+      // pick up its "running"/finished state if so.
+      pollSyncStatus();
       return true;
     }
     if (data.error) {
@@ -160,18 +165,52 @@ checkNotionStatus();
 // ---------- Notion sync ----------
 
 let syncPollTimer = null;
+let lastSyncedIso = null;
 
 function formatSyncedAt(iso) {
   if (!iso) {
     return 'Never synced';
   }
-  return new Date(iso).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+
+  const then = new Date(iso).getTime();
+  const diffSeconds = Math.round((Date.now() - then) / 1000);
+
+  if (diffSeconds < 30) {
+    return 'Just now';
+  }
+  if (diffSeconds < 60) {
+    return `${diffSeconds} seconds ago`;
+  }
+  const diffMinutes = Math.round(diffSeconds / 60);
+  if (diffMinutes < 60) {
+    return `${diffMinutes} minute${diffMinutes === 1 ? '' : 's'} ago`;
+  }
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
+  }
+  const diffDays = Math.round(diffHours / 24);
+  if (diffDays === 1) {
+    return 'Yesterday';
+  }
+  if (diffDays < 7) {
+    return `${diffDays} days ago`;
+  }
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
+
+function renderSyncValue(iso) {
+  lastSyncedIso = iso || null;
+  syncValue.textContent = formatSyncedAt(lastSyncedIso);
+}
+
+// Keeps the relative label ("Just now" -> "2 minutes ago" -> ...) fresh while
+// the side panel stays open, without re-polling the backend.
+setInterval(() => {
+  if (lastSyncedIso && !syncPollTimer) {
+    syncValue.textContent = formatSyncedAt(lastSyncedIso);
+  }
+}, 60 * 1000);
 
 function pollSyncStatus() {
   if (syncPollTimer) {
@@ -203,7 +242,7 @@ function pollSyncStatus() {
     refreshBtn.disabled = false;
 
     if (data.state === 'success') {
-      syncValue.textContent = formatSyncedAt(data.finished_at);
+      renderSyncValue(data.finished_at);
       refreshBtn.title = data.message || '';
     } else if (data.state === 'error') {
       syncValue.textContent = 'Sync failed';
@@ -266,23 +305,117 @@ queryInput.addEventListener('input', () => {
 
 // ---------- Submit query ----------
 
-function submitQuery() {
+const MAX_HISTORY_TURNS_SENT = 6;
+let conversationHistory = [];
+let queryInFlight = false;
+
+function appendMessage({ role, text, citations, isLoading, isError }) {
+  console.log('thread.hidden:', thread.hidden);
+  console.log('mainEmptyState:', mainEmptyState);
+  mainEmptyState.hidden = true;
+  thread.hidden = false;
+  // if (thread.hidden) {
+  //   mainEmptyState.hidden = true;
+  //   thread.hidden = false;
+  // }
+
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+  if (isLoading) msg.classList.add('loading');
+  if (isError) msg.classList.add('error');
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+
+  if (isLoading) {
+    bubble.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
+  } else {
+    bubble.textContent = text;
+  }
+  msg.appendChild(bubble);
+
+  if (citations && citations.length) {
+    const seenPages = new Set();
+    const citationsRow = document.createElement('div');
+    citationsRow.className = 'citations';
+    citations.forEach((c) => {
+      if (!c.url || seenPages.has(c.notion_page_id)) return;
+      seenPages.add(c.notion_page_id);
+      const link = document.createElement('a');
+      link.className = 'citation-link';
+      link.href = c.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = `[${c.index}] ${c.title || 'Untitled'}`;
+      citationsRow.appendChild(link);
+    });
+    if (citationsRow.children.length) {
+      msg.appendChild(citationsRow);
+    }
+  }
+
+  thread.appendChild(msg);
+  thread.scrollTop = thread.scrollHeight;
+  return msg;
+}
+
+async function submitQuery() {
   const query = queryInput.value.trim();
 
-  if (!query) {
+  if (!query || queryInFlight) {
     return;
   }
 
-  // Placeholder:
-  // Connect this to your Notion Lens query endpoint later.
-  console.log('Query submitted:', query);
-
-  // Clear input
+  queryInFlight = true;
   queryInput.value = '';
-
-  // Reset send button
   sendBtn.classList.remove('active');
   sendBtn.disabled = true;
+  queryInput.disabled = true;
+
+  appendMessage({ role: 'user', text: query });
+  const loadingMsg = appendMessage({ role: 'assistant', isLoading: true });
+
+  const historyToSend = conversationHistory.slice(-MAX_HISTORY_TURNS_SENT);
+
+  try {
+    const appUserId = await getAppUserId();
+    const res = await fetch(
+      `${BACKEND_BASE_URL}/notion/query?app_user_id=${encodeURIComponent(appUserId)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: query, history: historyToSend }),
+      }
+    );
+
+    loadingMsg.remove();
+
+    if (res.status === 409) {
+      appendMessage({ role: 'assistant', text: 'Connect Notion first to ask questions.', isError: true });
+      return;
+    }
+    if (!res.ok) {
+      throw new Error(`query_failed_${res.status}`);
+    }
+
+    const data = await res.json();
+    appendMessage({ role: 'assistant', text: data.answer, citations: data.citations });
+
+    conversationHistory.push({ role: 'user', content: query });
+    conversationHistory.push({ role: 'assistant', content: data.answer });
+  } catch (err) {
+    console.error('Query failed:', err);
+    loadingMsg.remove();
+    appendMessage({
+      role: 'assistant',
+      text: 'Something went wrong reaching Notion Lens. Please try again.',
+      isError: true,
+    });
+  } finally {
+    queryInFlight = false;
+    queryInput.disabled = false;
+    queryInput.focus();
+  }
 }
 
 

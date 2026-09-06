@@ -159,6 +159,34 @@ async def test_incremental_sync_reembeds_only_changed_pages(monkeypatch, wired_c
     assert abs((connection.last_synced_at - (now + timedelta(minutes=5))).total_seconds()) < 1
 
 
+async def test_noop_sync_still_advances_checkpoint(monkeypatch, wired_connection):
+    """A successful sync that finds nothing new must still bump last_synced_at —
+    otherwise auto-sync's "at most once per day" throttle would treat a quiet
+    connection as perpetually overdue and re-trigger on every check."""
+    user_id, connection_id = wired_connection
+    now = datetime.now(timezone.utc)
+    pages = [_make_page("page-a", "A", now - timedelta(hours=2))]
+    fake_notion = FakeNotion(pages, {"page-a": "content " * 200})
+    fake_embedder = FakeEmbedder()
+    monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
+    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
+
+    await sync_service.run_sync(user_id)  # first sync: indexes page-a
+
+    before_second_sync = datetime.now(timezone.utc)
+    fake_notion_2 = FakeNotion(pages, {"page-a": "content " * 200})
+    fake_embedder_2 = FakeEmbedder()
+    monkeypatch.setattr(notion_client, "search_pages", fake_notion_2.search_pages)
+    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion_2.get_page_plain_text)
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embedder_2.embed_texts)
+
+    await sync_service.run_sync(user_id)  # second sync: nothing new
+
+    connection = _get_connection(connection_id)
+    assert connection.last_synced_at >= before_second_sync
+
+
 async def test_sync_failure_does_not_advance_checkpoint(monkeypatch, wired_connection):
     user_id, connection_id = wired_connection
     now = datetime.now(timezone.utc)

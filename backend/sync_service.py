@@ -21,13 +21,14 @@ async def run_sync(app_user_id: uuid.UUID) -> None:
     connection. Meant to run as a background task — progress and the final result are
     reported through `sync_status`, not a return value."""
     key = str(app_user_id)
+    sync_started_at = notion_client.utcnow()
     sync_status.set_status(
         key,
         state="running",
         pages_processed=0,
         chunks_embedded=0,
         message=None,
-        started_at=notion_client.utcnow().isoformat(),
+        started_at=sync_started_at.isoformat(),
         finished_at=None,
     )
 
@@ -85,9 +86,12 @@ async def run_sync(app_user_id: uuid.UUID) -> None:
 
                 sync_status.set_status(key, pages_processed=pages_processed, chunks_embedded=chunks_embedded)
 
-        if max_last_edited is not None:
-            repositories.mark_synced(session, connection_id, max_last_edited)
-            session.commit()
+        # Even a no-op run (nothing newer than the checkpoint) is a successful sync
+        # attempt and must advance last_synced_at — otherwise a connection with no
+        # new content would look perpetually "overdue" and get re-triggered on
+        # every app-open / scheduler sweep instead of at most once a day.
+        repositories.mark_synced(session, connection_id, max_last_edited or sync_started_at)
+        session.commit()
 
         sync_status.set_status(
             key,

@@ -335,6 +335,126 @@ body {
   margin: 0 6px;
 }
 
+/* ---------- Chat thread ---------- */
+
+.thread {
+  flex: 1;
+  overflow-y: auto;
+
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+
+  padding: 18px 16px;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 88%;
+}
+
+.msg.user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.msg.assistant,
+.msg.error {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.msg-bubble {
+  font-family: "Inter", sans-serif;
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+
+  padding: 10px 14px;
+  border-radius: 16px;
+}
+
+.msg.user .msg-bubble {
+  background: var(--ink);
+  color: var(--paper);
+  border-bottom-right-radius: 4px;
+}
+
+.msg.assistant .msg-bubble {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 4px;
+}
+
+.msg.error .msg-bubble {
+  background: #fbeeea;
+  color: #8a3821;
+  border: 1px solid #e6c3b3;
+  border-bottom-left-radius: 4px;
+}
+
+.citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.citation-link {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10.5px;
+  color: var(--ink-soft);
+  text-decoration: none;
+
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 3px 9px;
+
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.citation-link:hover {
+  border-color: var(--focus);
+  background: var(--focus-soft);
+  color: var(--focus-dim);
+}
+
+.msg.loading .msg-bubble {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 14px;
+}
+
+.typing-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  animation: typing-bounce 1s ease-in-out infinite;
+}
+
+.typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.typing-dot:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes typing-bounce {
+  0%, 60%, 100% { opacity: 0.35; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing-dot {
+    animation: none;
+  }
+}
+
 /* ---------- Input bar ---------- */
 
 .inputbar {
@@ -438,6 +558,10 @@ body {
 .send-btn:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+[hidden] {
+    display: none !important;
 }
 
 /* ---------- Accessibility ---------- */

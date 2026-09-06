@@ -32,5 +32,17 @@ class Settings:
     EMBEDDER_API_URL = "https://integrate.api.nvidia.com/v1/embeddings"
     EMBEDDING_DIM = 2048
 
+    GENERATION_MODEL_API_KEY = _require("GENERATION_MODEL_API_KEY")
+    # nvidia/llama-3.3-nemotron-super-49b-v1.5 reached end-of-life on NVIDIA's API
+    # (2026-08-26) and returns HTTP 410; nemotron-3-super-120b-a12b is its direct
+    # successor in the current model catalog (same "super" reasoning tier).
+    GENERATION_MODEL_NAME = "nvidia/nemotron-3-super-120b-a12b"
+    GENERATION_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+    TOP_K_CHUNKS = 5
+
+    AUTO_SYNC_INTERVAL_HOURS = 24
+    AUTO_SYNC_ERROR_COOLDOWN_HOURS = 1
+    AUTO_SYNC_SWEEP_INTERVAL_MINUTES = 30
+
 
 settings = Settings()
