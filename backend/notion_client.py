@@ -6,18 +6,6 @@ import httpx
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-# Block types whose rich_text we render with a simple prefix, for slightly more
-# legible chunks. Anything not listed here still gets its rich_text extracted plainly.
-_BLOCK_PREFIXES = {
-    "heading_1": "# ",
-    "heading_2": "## ",
-    "heading_3": "### ",
-    "bulleted_list_item": "- ",
-    "numbered_list_item": "- ",
-    "to_do": "- ",
-    "quote": "> ",
-}
-
 
 class NotionAPIError(Exception):
     def __init__(self, status_code: int, message: str):
@@ -46,13 +34,17 @@ def extract_title(page: dict) -> Optional[str]:
     return None
 
 
-async def search_pages(
-    client: httpx.AsyncClient, access_token: str, since: Optional[datetime] = None
-) -> AsyncIterator[dict]:
-    """Yields Notion page objects sorted by last_edited_time descending.
+async def search_pages(client: httpx.AsyncClient, access_token: str) -> AsyncIterator[dict]:
+    """Yields every Notion page object the integration can currently see,
+    sorted by last_edited_time descending.
 
-    If `since` is given, stops as soon as a page at or older than `since` is seen
-    (safe because results are sorted descending), so only changed pages are yielded.
+    Always walks the full result set rather than stopping at the first
+    already-known page: last_edited_time can't distinguish "unchanged since
+    last sync" from "just shared with the integration but not recently
+    edited," so a newly-granted old page can sort anywhere in this list. The
+    caller (sync_service) decides which pages are worth re-fetching based on
+    what it already has stored — this call is cheap (metadata only, no block
+    or embedding fetches), so scanning it in full every run is fine.
     """
     cursor = None
     while True:
@@ -72,9 +64,6 @@ async def search_pages(
 
         data = resp.json()
         for page in data.get("results", []):
-            last_edited = parse_timestamp(page["last_edited_time"])
-            if since is not None and last_edited <= since:
-                return
             yield page
 
         if not data.get("has_more"):
@@ -109,33 +98,65 @@ async def _fetch_block_children(client: httpx.AsyncClient, access_token: str, bl
     return blocks
 
 
-async def _blocks_to_text(client: httpx.AsyncClient, access_token: str, block_id: str, depth: int = 0) -> str:
-    if depth > 10:
-        return ""
+def _block_to_record(block: dict, depth: int) -> dict:
+    """Pure extraction: one raw Notion block dict -> one structured record.
+    No markdown rendering and no sibling/ordering knowledge here (list_index
+    is filled in by the caller, which owns sequencing across siblings)."""
+    block_type = block.get("type")
+    payload = block.get(block_type, {})
 
-    lines = []
-    for block in await _fetch_block_children(client, access_token, block_id):
-        block_type = block.get("type")
-        payload = block.get(block_type, {})
+    heading_level = None
+    if block_type in ("heading_1", "heading_2", "heading_3"):
+        heading_level = int(block_type[-1])
+
+    if block_type == "table_row":
+        cells = ["".join(t.get("plain_text", "") for t in cell) for cell in payload.get("cells", [])]
+        text = ""
+    else:
+        cells = None
         rich_text = payload.get("rich_text", [])
         text = "".join(t.get("plain_text", "") for t in rich_text)
 
-        if text:
-            prefix = _BLOCK_PREFIXES.get(block_type, "")
-            lines.append(f"{prefix}{text}")
-        elif block_type == "code" and payload.get("rich_text"):
-            lines.append(text)
+    return {
+        "id": block.get("id"),
+        "type": block_type,
+        "depth": depth,
+        "heading_level": heading_level,
+        "text": text,
+        "language": payload.get("language") if block_type == "code" else None,
+        "checked": payload.get("checked") if block_type == "to_do" else None,
+        "list_index": None,
+        "has_children": bool(block.get("has_children")),
+        "cells": cells,
+        "has_column_header": payload.get("has_column_header") if block_type == "table" else None,
+    }
+
+
+async def _blocks_to_records(client: httpx.AsyncClient, access_token: str, block_id: str, depth: int = 0) -> list[dict]:
+    if depth > 10:
+        return []
+
+    records = []
+    numbered_run = 0
+    for block in await _fetch_block_children(client, access_token, block_id):
+        record = _block_to_record(block, depth)
+
+        if record["type"] == "numbered_list_item":
+            numbered_run += 1
+            record["list_index"] = numbered_run
+        else:
+            numbered_run = 0
+
+        records.append(record)
 
         if block.get("has_children"):
-            child_text = await _blocks_to_text(client, access_token, block["id"], depth + 1)
-            if child_text:
-                lines.append(child_text)
+            records.extend(await _blocks_to_records(client, access_token, block["id"], depth + 1))
 
-    return "\n".join(lines)
+    return records
 
 
-async def get_page_plain_text(client: httpx.AsyncClient, access_token: str, page_id: str) -> str:
-    return await _blocks_to_text(client, access_token, page_id)
+async def get_page_blocks(client: httpx.AsyncClient, access_token: str, page_id: str) -> list[dict]:
+    return await _blocks_to_records(client, access_token, page_id)
 
 
 async def get_owner_email(client: httpx.AsyncClient, access_token: str) -> Optional[str]:

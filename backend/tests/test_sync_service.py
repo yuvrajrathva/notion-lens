@@ -10,6 +10,26 @@ from db import SessionLocal
 from models import NotionConnection
 
 
+def _para_blocks(text: str) -> list[dict]:
+    if not text:
+        return []
+    return [
+        {
+            "id": "blk-0",
+            "type": "paragraph",
+            "depth": 0,
+            "heading_level": None,
+            "text": text,
+            "language": None,
+            "checked": None,
+            "list_index": None,
+            "has_children": False,
+            "cells": None,
+            "has_column_header": None,
+        }
+    ]
+
+
 def _make_page(page_id: str, title: str, last_edited: datetime) -> dict:
     return {
         "id": page_id,
@@ -30,17 +50,14 @@ class FakeNotion:
         self.search_calls = 0
         self.content_fetch_calls: list[str] = []
 
-    async def search_pages(self, client, access_token, since=None):
+    async def search_pages(self, client, access_token):
         self.search_calls += 1
         for page in self.pages:
-            last_edited = notion_client.parse_timestamp(page["last_edited_time"])
-            if since is not None and last_edited <= since:
-                return
             yield page
 
-    async def get_page_plain_text(self, client, access_token, page_id):
+    async def get_page_blocks(self, client, access_token, page_id):
         self.content_fetch_calls.append(page_id)
-        return self.page_text.get(page_id, "")
+        return _para_blocks(self.page_text.get(page_id, ""))
 
 
 class FakeEmbedder:
@@ -83,7 +100,7 @@ async def test_full_sync_indexes_all_pages_and_sets_checkpoint(monkeypatch, wire
     fake_embedder = FakeEmbedder()
 
     monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
 
     await sync_service.run_sync(user_id)
@@ -104,7 +121,7 @@ async def test_incremental_sync_skips_unchanged_pages(monkeypatch, wired_connect
     fake_notion = FakeNotion(pages, {"page-a": "content " * 200})
     fake_embedder = FakeEmbedder()
     monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
 
     await sync_service.run_sync(user_id)
@@ -114,7 +131,7 @@ async def test_incremental_sync_skips_unchanged_pages(monkeypatch, wired_connect
     fake_embedder_2 = FakeEmbedder()
     fake_notion_2 = FakeNotion(pages, {"page-a": "content " * 200})
     monkeypatch.setattr(notion_client, "search_pages", fake_notion_2.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion_2.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion_2.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder_2.embed_texts)
 
     await sync_service.run_sync(user_id)
@@ -134,7 +151,7 @@ async def test_incremental_sync_reembeds_only_changed_pages(monkeypatch, wired_c
     fake_notion = FakeNotion(pages_v1, {"page-a": "aaa " * 200, "page-b": "bbb " * 200})
     fake_embedder = FakeEmbedder()
     monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
     await sync_service.run_sync(user_id)
     assert fake_embedder.embed_calls == 2
@@ -147,7 +164,7 @@ async def test_incremental_sync_reembeds_only_changed_pages(monkeypatch, wired_c
     fake_notion_2 = FakeNotion(pages_v2, {"page-a": "aaa updated " * 200, "page-b": "bbb " * 200})
     fake_embedder_2 = FakeEmbedder()
     monkeypatch.setattr(notion_client, "search_pages", fake_notion_2.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion_2.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion_2.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder_2.embed_texts)
 
     await sync_service.run_sync(user_id)
@@ -169,7 +186,7 @@ async def test_noop_sync_still_advances_checkpoint(monkeypatch, wired_connection
     fake_notion = FakeNotion(pages, {"page-a": "content " * 200})
     fake_embedder = FakeEmbedder()
     monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
 
     await sync_service.run_sync(user_id)  # first sync: indexes page-a
@@ -178,13 +195,47 @@ async def test_noop_sync_still_advances_checkpoint(monkeypatch, wired_connection
     fake_notion_2 = FakeNotion(pages, {"page-a": "content " * 200})
     fake_embedder_2 = FakeEmbedder()
     monkeypatch.setattr(notion_client, "search_pages", fake_notion_2.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion_2.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion_2.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embedder_2.embed_texts)
 
     await sync_service.run_sync(user_id)  # second sync: nothing new
 
     connection = _get_connection(connection_id)
     assert connection.last_synced_at >= before_second_sync
+
+
+async def test_sync_picks_up_newly_shared_page_older_than_checkpoint(monkeypatch, wired_connection):
+    """A page the user just shared with the integration might not have been
+    edited recently — its last_edited_time can sort anywhere in Notion's
+    descending page list regardless of when access was granted. Sync must
+    still find it (by scanning the full list every run), while skipping the
+    already-known, unchanged page without re-fetching or re-embedding it."""
+    user_id, connection_id = wired_connection
+    now = datetime.now(timezone.utc)
+    pages = [_make_page("page-a", "A", now - timedelta(hours=2))]
+    fake_notion = FakeNotion(pages, {"page-a": "content " * 200})
+    fake_embedder = FakeEmbedder()
+    monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embedder.embed_texts)
+
+    await sync_service.run_sync(user_id)  # first sync: indexes page-a, sets checkpoint
+
+    # Simulate the user granting access to an old page ("page-old") that predates
+    # the checkpoint, alongside the already-known, unchanged page-a.
+    old_page = _make_page("page-old", "Old Page", now - timedelta(days=30))
+    fake_notion_2 = FakeNotion(
+        [*pages, old_page], {"page-a": "content " * 200, "page-old": "old content " * 200}
+    )
+    fake_embedder_2 = FakeEmbedder()
+    monkeypatch.setattr(notion_client, "search_pages", fake_notion_2.search_pages)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion_2.get_page_blocks)
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embedder_2.embed_texts)
+
+    await sync_service.run_sync(user_id)
+
+    assert fake_notion_2.content_fetch_calls == ["page-old"]  # page-a skipped, unchanged
+    assert fake_embedder_2.embed_calls == 1
 
 
 async def test_sync_failure_does_not_advance_checkpoint(monkeypatch, wired_connection):
@@ -197,7 +248,7 @@ async def test_sync_failure_does_not_advance_checkpoint(monkeypatch, wired_conne
         raise embeddings.EmbeddingError("simulated failure")
 
     monkeypatch.setattr(notion_client, "search_pages", fake_notion.search_pages)
-    monkeypatch.setattr(notion_client, "get_page_plain_text", fake_notion.get_page_plain_text)
+    monkeypatch.setattr(notion_client, "get_page_blocks", fake_notion.get_page_blocks)
     monkeypatch.setattr(embeddings, "embed_texts", failing_embed)
 
     await sync_service.run_sync(user_id)

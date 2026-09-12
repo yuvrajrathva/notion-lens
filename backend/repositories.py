@@ -136,6 +136,19 @@ def mark_synced(session: Session, connection_id: uuid.UUID, synced_at: datetime)
         session.flush()
 
 
+def get_last_edited_map(session: Session, connection_id: uuid.UUID) -> dict[str, datetime]:
+    """notion_page_id -> last_edited_time for every page already indexed under
+    this connection. sync_service uses this to decide, for each page Notion's
+    full search results return, whether it's already up to date (skip) or new
+    / changed (fetch content and re-embed)."""
+    rows = session.execute(
+        select(NotionPage.notion_page_id, NotionPage.last_edited_time).where(
+            NotionPage.connection_id == connection_id
+        )
+    ).all()
+    return {notion_page_id: last_edited_time for notion_page_id, last_edited_time in rows}
+
+
 def upsert_page(
     session: Session,
     connection_id: uuid.UUID,

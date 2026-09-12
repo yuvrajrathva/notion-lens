@@ -15,6 +15,7 @@ const mainEmptyState = document.getElementById('mainEmptyState');
 // ---------- Notion connect ----------
 
 const connectBtn = document.getElementById('connectBtn');
+const addPagesBtn = document.getElementById('addPagesBtn');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 
@@ -46,11 +47,17 @@ function setConnectionState(state, detail) {
   connectBtn.disabled = state === 'connecting';
   connectBtn.classList.toggle('connected', state === 'connected');
   refreshBtn.disabled = state !== 'connected';
+  addPagesBtn.hidden = state !== 'connected';
+  if (state !== 'connected') {
+    addPagesBtn.disabled = false;
+    addPagesBtn.title = "Add Pages"
+    addPagesBtn.textContent = '+';
+  }
 
   if (state === 'connected') {
     statusText.textContent = detail && detail.workspace_name
-      ? `Connected · ${detail.workspace_name}`
-      : 'Notion Connected';
+      ? `${detail.workspace_name}`
+      : '';
     connectBtn.textContent = 'Notion Connected';
     queryInput.disabled = false;
     queryInput.placeholder = 'Ask your notes…';
@@ -64,7 +71,7 @@ function setConnectionState(state, detail) {
     queryInput.disabled = true;
     queryInput.placeholder = 'Connect Notion to start asking…';
   } else {
-    statusText.textContent = 'Notion not connected';
+    // statusText.textContent = 'Notion not connected';
     connectBtn.textContent = 'Connect Notion';
     queryInput.disabled = true;
     queryInput.placeholder = 'Connect Notion to start asking…';
@@ -157,6 +164,92 @@ connectBtn.addEventListener('click', () => {
   }
   startNotionConnect();
 });
+
+// Re-opening Notion's OAuth consent screen for an already-connected workspace
+// re-shows its page picker with prior selections kept, letting the user grant
+// access to more pages without disconnecting. The backend detects this as a
+// reconnect and force-syncs everything the integration can now see (a newly
+// shared but not-recently-edited page wouldn't surface via the normal
+// incremental sync).
+let addPagesPollTimer = null;
+
+async function startAddPages() {
+  if (addPagesPollTimer || addPagesBtn.disabled) {
+    return;
+  }
+
+  const appUserId = await getAppUserId();
+  addPagesBtn.disabled = true;
+  addPagesBtn.textContent = 'Waiting for Notion…';
+
+  let authorizeUrl;
+  try {
+    const res = await fetch(
+      `${BACKEND_BASE_URL}/auth/notion/login?app_user_id=${encodeURIComponent(appUserId)}`
+    );
+    if (!res.ok) {
+      throw new Error('login_request_failed');
+    }
+    const data = await res.json();
+    if (!data.authorize_url) {
+      throw new Error('missing_authorize_url');
+    }
+    authorizeUrl = data.authorize_url;
+  } catch (err) {
+    console.error('Failed to start add-pages flow:', err);
+    addPagesBtn.disabled = false;
+    addPagesBtn.title = "Add Pages"
+    addPagesBtn.textContent = '+';
+    return;
+  }
+
+  chrome.tabs.create({ url: authorizeUrl });
+
+  const startedAt = Date.now();
+  const POLL_INTERVAL_MS = 1500;
+  const TIMEOUT_MS = 3 * 60 * 1000;
+  let sawRunning = false;
+
+  addPagesPollTimer = setInterval(async () => {
+    let data;
+    try {
+      const res = await fetch(
+        `${BACKEND_BASE_URL}/notion/sync/status?app_user_id=${encodeURIComponent(appUserId)}`
+      );
+      data = await res.json();
+    } catch (err) {
+      console.error('Add-pages sync status check failed:', err);
+      return;
+    }
+
+    if (data.state === 'running') {
+      sawRunning = true;
+      const count = data.pages_processed || 0;
+      syncValue.textContent = `Adding pages… ${count} page${count === 1 ? '' : 's'}`;
+      return;
+    }
+
+    const timedOut = Date.now() - startedAt > TIMEOUT_MS;
+    if (!sawRunning && !timedOut) {
+      return;
+    }
+
+    clearInterval(addPagesPollTimer);
+    addPagesPollTimer = null;
+    addPagesBtn.disabled = false;
+    addPagesBtn.title = "Add Pages"
+    addPagesBtn.textContent = '+';
+
+    if (sawRunning && data.state === 'success') {
+      renderSyncValue(data.finished_at);
+    } else if (sawRunning && data.state === 'error') {
+      syncValue.textContent = 'Sync failed';
+      console.error('Add-pages sync failed:', data.message);
+    }
+  }, POLL_INTERVAL_MS);
+}
+
+addPagesBtn.addEventListener('click', startAddPages);
 
 setConnectionState('disconnected');
 checkNotionStatus();
@@ -310,14 +403,10 @@ let conversationHistory = [];
 let queryInFlight = false;
 
 function appendMessage({ role, text, citations, isLoading, isError }) {
-  console.log('thread.hidden:', thread.hidden);
-  console.log('mainEmptyState:', mainEmptyState);
-  mainEmptyState.hidden = true;
-  thread.hidden = false;
-  // if (thread.hidden) {
-  //   mainEmptyState.hidden = true;
-  //   thread.hidden = false;
-  // }
+  if (thread.hidden) {
+    mainEmptyState.hidden = true;
+    thread.hidden = false;
+  }
 
   const msg = document.createElement('div');
   msg.className = `msg ${role}`;

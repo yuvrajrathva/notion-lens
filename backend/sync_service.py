@@ -19,7 +19,19 @@ class SyncError(Exception):
 async def run_sync(app_user_id: uuid.UUID) -> None:
     """Runs a full (first-ever) or incremental sync for the given app user's Notion
     connection. Meant to run as a background task — progress and the final result are
-    reported through `sync_status`, not a return value."""
+    reported through `sync_status`, not a return value.
+
+    Scans Notion's full page list every run (cheap: metadata only — see
+    notion_client.search_pages) rather than stopping once last_edited_time
+    drops below the last checkpoint. That early-stop would miss a page the
+    user just shared with the integration but hasn't edited recently: its
+    last_edited_time can sort anywhere in the descending list, and Notion's
+    API has no separate "granted to integration at" timestamp to filter on.
+    Only pages that are new, or whose last_edited_time is newer than what's
+    already stored, get fetched and re-embedded — everything else is skipped
+    before any expensive Notion/embedding call, so this stays "incremental"
+    in cost even though it's no longer incremental in what it scans.
+    """
     key = str(app_user_id)
     sync_started_at = notion_client.utcnow()
     sync_status.set_status(
@@ -40,16 +52,21 @@ async def run_sync(app_user_id: uuid.UUID) -> None:
 
         connection_id = connection.id
         access_token = connection.access_token
-        since = connection.last_synced_at
+        known_pages = repositories.get_last_edited_map(session, connection_id)
 
         pages_processed = 0
         chunks_embedded = 0
         max_last_edited = None
 
         async with httpx.AsyncClient() as client:
-            async for page in notion_client.search_pages(client, access_token, since=since):
+            async for page in notion_client.search_pages(client, access_token):
                 notion_page_id = page["id"]
                 last_edited_time = notion_client.parse_timestamp(page["last_edited_time"])
+
+                known_edited = known_pages.get(notion_page_id)
+                if known_edited is not None and known_edited >= last_edited_time:
+                    continue  # already indexed and unchanged
+
                 title = notion_client.extract_title(page)
                 metadata = {
                     "url": page.get("url"),
@@ -57,9 +74,10 @@ async def run_sync(app_user_id: uuid.UUID) -> None:
                     "parent": page.get("parent"),
                 }
 
-                text = await notion_client.get_page_plain_text(client, access_token, notion_page_id)
-                chunks = chunking.chunk_text(text)
-                vectors = await embeddings.embed_texts(client, chunks, input_type="passage") if chunks else []
+                blocks = await notion_client.get_page_blocks(client, access_token, notion_page_id)
+                chunk_records = chunking.chunk_blocks(blocks, page_title=title)
+                texts = [record["content"] for record in chunk_records]
+                vectors = await embeddings.embed_texts(client, texts, input_type="passage") if texts else []
 
                 page_row = repositories.upsert_page(
                     session,
@@ -73,14 +91,19 @@ async def run_sync(app_user_id: uuid.UUID) -> None:
                     session,
                     page_id=page_row.id,
                     chunks=[
-                        {"chunk_index": i, "content": content, "embedding": vector}
-                        for i, (content, vector) in enumerate(zip(chunks, vectors))
+                        {
+                            "chunk_index": i,
+                            "content": record["content"],
+                            "embedding": vector,
+                            "metadata": record["metadata"],
+                        }
+                        for i, (record, vector) in enumerate(zip(chunk_records, vectors))
                     ],
                 )
                 session.commit()
 
                 pages_processed += 1
-                chunks_embedded += len(chunks)
+                chunks_embedded += len(chunk_records)
                 if max_last_edited is None or last_edited_time > max_last_edited:
                     max_last_edited = last_edited_time
 

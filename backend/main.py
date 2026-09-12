@@ -78,7 +78,11 @@ def notion_login(app_user_id: str = Query(..., min_length=1, max_length=128)):
 
 
 @app.get("/auth/notion/callback")
-async def notion_callback(request: Request, session: Session = Depends(get_session)):
+async def notion_callback(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+):
     params = request.query_params
     error = params.get("error")
     state = params.get("state")
@@ -121,6 +125,13 @@ async def notion_callback(request: Request, session: Session = Depends(get_sessi
         _pending_errors[app_user_id] = "missing_email"
         return RedirectResponse("/auth/notion/complete?status=error&reason=missing_email")
 
+    # Re-running this same OAuth flow on an already-connected workspace is how
+    # Notion lets the user grant access to additional pages ("Add pages" in the
+    # side panel) — Notion's consent screen re-shows the page picker with prior
+    # selections kept, and the returned token covers the full, possibly-larger
+    # set of pages. Detect that case so we know to force a full re-scan below.
+    is_reconnect = repositories.get_connection_for_user(session, user_uuid) is not None
+
     try:
         repositories.upsert_app_user(session, user_uuid, email)
         repositories.upsert_connection(
@@ -138,6 +149,15 @@ async def notion_callback(request: Request, session: Session = Depends(get_sessi
         return RedirectResponse("/auth/notion/complete?status=error&reason=email_already_linked")
 
     _pending_errors.pop(app_user_id, None)
+
+    if is_reconnect:
+        # sync_service.run_sync always scans the full page list and skips only
+        # what's already indexed and unchanged, so a normal sync already picks
+        # up newly-shared pages regardless of how recently they were edited.
+        # Kick one off now for immediate feedback instead of waiting for the
+        # next once-a-day auto-sync.
+        background_tasks.add_task(sync_service.run_sync, user_uuid)
+
     return RedirectResponse("/auth/notion/complete?status=success")
 
 
