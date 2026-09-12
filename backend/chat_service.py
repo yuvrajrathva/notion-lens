@@ -40,14 +40,28 @@ class NotConnectedError(ChatError):
     pass
 
 
-# Add citation URL to each chunk
-def build_context_block(chunks: list[dict]) -> str:
+def _group_chunks_by_page(chunks: list[dict]) -> list[list[dict]]:
+    """Buckets the RRF-ranked chunks by notion_page_id, preserving each
+    page's first-appearance order. The outer list's order (which page
+    appears first) determines that page's citation/source index - keeping
+    citations page-level rather than per-chunk avoids citing the same page
+    under multiple numbers."""
+    groups: dict[str, list[dict]] = {}
+    for chunk in chunks:
+        groups.setdefault(chunk.get("notion_page_id"), []).append(chunk)
+    return list(groups.values())
+
+
+# Add citation URL to each source
+def build_context_block(page_groups: list[list[dict]]) -> str:
     sources = []
-    for i, chunk in enumerate(chunks, start=1):
-        title = chunk.get("title") or "Untitled"
-        url = (chunk.get("metadata") or {}).get("url")
+    for i, page_chunks in enumerate(page_groups, start=1):
+        first = page_chunks[0]
+        title = first.get("title") or "Untitled"
+        url = (first.get("metadata") or {}).get("url")
         header = f"Source [{i}]: {title}" + (f" ({url})" if url else "")
-        sources.append(f"{header}\n{chunk['content']}")
+        body = "\n\n".join(chunk["content"] for chunk in page_chunks)
+        sources.append(f"{header}\n{body}")
     return "\n\n".join(sources)
 
 
@@ -65,15 +79,16 @@ def build_messages(question: str, history: list[dict], context_block: str) -> li
     ]
 
 
-def _build_citations(chunks: list[dict]) -> list[dict]:
+def _build_citations(page_groups: list[list[dict]]) -> list[dict]:
     citations = []
-    for i, chunk in enumerate(chunks, start=1):
+    for i, page_chunks in enumerate(page_groups, start=1):
+        first = page_chunks[0]
         citations.append(
             {
                 "index": i,
-                "title": chunk.get("title") or "Untitled",
-                "url": (chunk.get("metadata") or {}).get("url"),
-                "notion_page_id": chunk.get("notion_page_id"),
+                "title": first.get("title") or "Untitled",
+                "url": (first.get("metadata") or {}).get("url"),
+                "notion_page_id": first.get("notion_page_id"),
             }
         )
     return citations
@@ -106,11 +121,12 @@ async def answer_question(app_user_id: uuid.UUID, question: str, history: list[d
             if not chunks:
                 return {"answer": NO_CONTEXT_ANSWER, "citations": []}
 
-            context_block = build_context_block(chunks)
+            page_groups = _group_chunks_by_page(chunks)
+            context_block = build_context_block(page_groups)
             messages = build_messages(question, history, context_block)
             answer = await generation.generate_answer(client, messages)
 
-        return {"answer": answer, "citations": _build_citations(chunks)}
+        return {"answer": answer, "citations": _build_citations(page_groups)}
     except (EmbeddingError, GenerationError) as exc:
         raise ChatError(str(exc)) from exc
     finally:

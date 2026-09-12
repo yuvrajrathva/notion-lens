@@ -424,12 +424,10 @@ function appendMessage({ role, text, citations, isLoading, isError }) {
   msg.appendChild(bubble);
 
   if (citations && citations.length) {
-    const seenPages = new Set();
     const citationsRow = document.createElement('div');
     citationsRow.className = 'citations';
     citations.forEach((c) => {
-      if (!c.url || seenPages.has(c.notion_page_id)) return;
-      seenPages.add(c.notion_page_id);
+      if (!c.url) return;
       const link = document.createElement('a');
       link.className = 'citation-link';
       link.href = c.url;
