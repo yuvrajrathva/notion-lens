@@ -39,6 +39,7 @@ class Settings:
     GENERATION_MODEL_NAME = "nvidia/nemotron-3-super-120b-a12b"
     GENERATION_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
     TOP_K_CHUNKS = 5
+    HYBRID_CANDIDATE_POOL = 20  # per-retriever candidate pool size before RRF fusion
 
     AUTO_SYNC_INTERVAL_HOURS = 24
     AUTO_SYNC_ERROR_COOLDOWN_HOURS = 1

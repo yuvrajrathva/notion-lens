@@ -117,6 +117,38 @@ def search_similar_chunks(
     return [dict(row) for row in rows]
 
 
+_SEARCH_KEYWORD_CHUNKS_SQL = text(
+    """
+    SELECT c.id, c.content, c.chunk_index, p.id AS page_id, p.title,
+           p.notion_page_id, p.metadata,
+           ts_rank_cd(c.content_tsv, websearch_to_tsquery('english', :query)) AS rank
+    FROM notion_chunks c
+    JOIN notion_pages p ON p.id = c.page_id
+    JOIN notion_connections conn ON conn.id = p.connection_id
+    WHERE conn.app_user_id = :app_user_id
+      AND c.content_tsv @@ websearch_to_tsquery('english', :query)
+    ORDER BY rank DESC
+    LIMIT :limit
+    """
+)
+
+
+def search_keyword_chunks(
+    session: Session, app_user_id: uuid.UUID, query: str, limit: int = 5
+) -> list[dict]:
+    """Top-`limit` chunks by full-text rank (websearch_to_tsquery over the
+    breadcrumb+body `content_tsv` generated column), scoped to the given
+    user's own Notion connection(s) only. `@@` is a hard filter, so this can
+    return fewer than `limit` rows, or none, when nothing lexically matches -
+    unlike search_similar_chunks, which always returns up to `limit` rows
+    regardless of relevance."""
+    rows = session.execute(
+        _SEARCH_KEYWORD_CHUNKS_SQL,
+        {"query": query, "app_user_id": app_user_id, "limit": limit},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def get_public_status(session: Session, app_user_id: uuid.UUID) -> Optional[dict]:
     connection = get_connection_for_user(session, app_user_id)
     if not connection:

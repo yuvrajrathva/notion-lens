@@ -142,3 +142,50 @@ def test_search_similar_chunks_is_scoped_to_the_calling_user(db_session, make_ap
 
     assert len(results) == 1
     assert results[0]["content"] == "user a chunk"
+
+
+def test_search_keyword_chunks_orders_by_rank(db_session, make_app_user):
+    dim = 2048
+    user_id = make_app_user()
+    zero_vec = _unit_vector(dim, 0)
+
+    dense = "The quarterly report is attached below for review."
+    sparse = "quarterly " + ("filler word " * 100) + " report"
+    non_matching = "This chunk talks about elephants and giraffes only."
+
+    _make_chunk_page(db_session, user_id, "ws-dense", dense, zero_vec, dim)
+    _make_chunk_page(db_session, user_id, "ws-sparse", sparse, zero_vec, dim)
+    _make_chunk_page(db_session, user_id, "ws-none", non_matching, zero_vec, dim)
+
+    results = repositories.search_keyword_chunks(db_session, user_id, "quarterly report", limit=5)
+
+    assert [r["content"] for r in results] == [dense, sparse]
+    assert results[0]["rank"] > results[1]["rank"]
+
+
+def test_search_keyword_chunks_is_scoped_to_the_calling_user(db_session, make_app_user):
+    dim = 2048
+    user_a = make_app_user()
+    user_b = make_app_user()
+    zero_vec = _unit_vector(dim, 0)
+
+    # user_b's chunk is a perfect keyword match, but must never appear in
+    # user_a's results.
+    _make_chunk_page(db_session, user_a, "ws-a", "no relevant keywords here", zero_vec, dim)
+    _make_chunk_page(db_session, user_b, "ws-b", "pangolin research notes", zero_vec, dim)
+
+    results = repositories.search_keyword_chunks(db_session, user_a, "pangolin", limit=5)
+
+    assert results == []
+
+
+def test_search_keyword_chunks_returns_empty_list_when_no_terms_match(db_session, make_app_user):
+    dim = 2048
+    user_id = make_app_user()
+    zero_vec = _unit_vector(dim, 0)
+
+    _make_chunk_page(db_session, user_id, "ws-a", "some ordinary chunk content", zero_vec, dim)
+
+    results = repositories.search_keyword_chunks(db_session, user_id, "nonexistentlexeme", limit=5)
+
+    assert results == []

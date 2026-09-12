@@ -4,6 +4,7 @@ import httpx
 
 import embeddings
 import generation
+import ranking
 import repositories
 from config import settings
 from db import SessionLocal
@@ -92,8 +93,14 @@ async def answer_question(app_user_id: uuid.UUID, question: str, history: list[d
             query_vector = (
                 await embeddings.embed_texts(client, [question], input_type="query")
             )[0]
-            chunks = repositories.search_similar_chunks(
-                session, app_user_id, query_vector, limit=settings.TOP_K_CHUNKS
+            vector_chunks = repositories.search_similar_chunks(
+                session, app_user_id, query_vector, limit=settings.HYBRID_CANDIDATE_POOL
+            )
+            keyword_chunks = repositories.search_keyword_chunks(
+                session, app_user_id, question, limit=settings.HYBRID_CANDIDATE_POOL
+            )
+            chunks = ranking.reciprocal_rank_fusion(
+                vector_chunks, keyword_chunks, k=60, limit=settings.TOP_K_CHUNKS
             )
 
             if not chunks:
